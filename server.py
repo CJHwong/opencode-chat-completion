@@ -5,7 +5,10 @@ A simple HTTP server that converts opencode commands to OpenAI-compatible chat c
 
 import asyncio
 import json
+import logging
+import os
 import re
+import shutil
 import time
 import uuid
 from collections.abc import AsyncGenerator
@@ -17,6 +20,14 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, validator
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(), logging.FileHandler('opencode_completion_api.log')],
+)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -110,36 +121,107 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 class OpenCodeExecutor:
     model = 'github-copilot/gpt-4.1'
 
+    def __init__(self):
+        # Try to find opencode executable
+        self.opencode_path = self._find_opencode_executable()
+        logger.debug(f'OpenCode executable found at: {self.opencode_path}')
+
+    def _find_opencode_executable(self) -> str:
+        """Find the opencode executable in various common locations"""
+        # Log current environment
+        logger.debug(f'Current PATH: {os.environ.get("PATH", "Not set")}')
+        logger.debug(f'Current working directory: {os.getcwd()}')
+
+        # First try using shutil.which (respects PATH)
+        opencode_path = shutil.which('opencode')
+        if opencode_path:
+            logger.debug(f'Found opencode via PATH: {opencode_path}')
+            return opencode_path
+
+        # Common installation paths to check
+        common_paths = [
+            '/usr/local/bin/opencode',
+            '/opt/homebrew/bin/opencode',
+            '/usr/bin/opencode',
+            os.path.expanduser('~/.opencode/bin/opencode'),  # OpenCode's default installation path
+            os.path.expanduser('~/.local/bin/opencode'),
+            os.path.expanduser('~/bin/opencode'),
+        ]
+
+        for path in common_paths:
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                logger.debug(f'Found opencode at: {path}')
+                return path
+
+        logger.warning("Could not find opencode executable, falling back to 'opencode'")
+        return 'opencode'
+
     async def execute_opencode(self, query: str) -> AsyncGenerator[str, None]:
         """Execute opencode command and yield output content in real-time"""
+        logger.debug(f'Starting opencode execution with model: {self.model}')
+        logger.debug(f'Query length: {len(query)} characters')
+
         wrapped_query = f"""{query}
 
 IMPORTANT: Wrap your entire response in <opencode_output></opencode_output> tags. Put ALL your output content inside these tags."""
 
-        process = await asyncio.create_subprocess_shell(
-            f'opencode --model "{self.model}" run -',
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
+        command = f'"{self.opencode_path}" --model "{self.model}" run -'
+        logger.debug(f'Executing command: {command}')
 
-        if process.stdout is None or process.stdin is None:
+        # Set up environment with extended PATH for subprocess
+        env = os.environ.copy()
+        additional_paths = [
+            '/usr/local/bin',
+            '/opt/homebrew/bin',
+            os.path.expanduser('~/.opencode/bin'),  # OpenCode's default installation path
+            os.path.expanduser('~/.local/bin'),
+            os.path.expanduser('~/bin'),
+        ]
+        current_path = env.get('PATH', '')
+        extended_path = ':'.join(additional_paths + [current_path])
+        env['PATH'] = extended_path
+        logger.debug(f'Extended PATH for subprocess: {extended_path}')
+
+        try:
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,  # Separate stderr for better debugging
+                env=env,
+            )
+            logger.debug(f'Process created with PID: {process.pid}')
+        except Exception as e:
+            logger.error(f'Failed to create subprocess: {e}')
+            raise
+
+        if process.stdout is None or process.stdin is None or process.stderr is None:
+            logger.error('Process stdin, stdout, or stderr is None')
             raise RuntimeError('Failed to start opencode process')
 
         # Send the wrapped query to stdin
-        process.stdin.write(wrapped_query.encode())
-        await process.stdin.drain()
-        process.stdin.close()
+        try:
+            logger.debug('Sending query to opencode process')
+            process.stdin.write(wrapped_query.encode())
+            await process.stdin.drain()
+            process.stdin.close()
+            logger.debug('Query sent successfully, stdin closed')
+        except Exception as e:
+            logger.error(f'Failed to send query to process: {e}')
+            raise
 
         inside_tags = False
         first_output_line = False
         line_buffer = ''
         byte_buffer = bytearray()
+        total_chars_yielded = 0
 
+        logger.debug('Starting to read output from opencode process')
         while True:
             # Read byte by byte and handle multi-byte UTF-8 characters
             byte_data = await process.stdout.read(1)
             if not byte_data:
+                logger.debug('No more data from process stdout')
                 break
 
             byte_buffer.extend(byte_data)
@@ -188,13 +270,33 @@ IMPORTANT: Wrap your entire response in <opencode_output></opencode_output> tags
                     # Stream each character from the completed line
                     for line_char in clean_line:
                         yield line_char
+                        total_chars_yielded += 1
 
                     # Add newline after each line
                     yield '\n'
+                    total_chars_yielded += 1
 
                 line_buffer = ''
 
-        await process.wait()
+        return_code = await process.wait()
+        logger.debug(f'Process completed with return code: {return_code}')
+        logger.debug(f'Total characters yielded: {total_chars_yielded}')
+
+        # Read any stderr output for debugging
+        if process.stderr:
+            stderr_output = await process.stderr.read()
+            if stderr_output:
+                stderr_text = stderr_output.decode('utf-8', errors='replace')
+                logger.error(f'OpenCode stderr output: {stderr_text}')
+
+        if return_code != 0:
+            logger.error(f'OpenCode process failed with return code: {return_code}')
+            if total_chars_yielded == 0:
+                logger.error('No output was generated - this suggests opencode command failed to run')
+                raise RuntimeError(f'OpenCode command failed with exit code {return_code}')
+
+        if total_chars_yielded == 0:
+            logger.warning('Process completed successfully but no output was generated')
 
 
 def create_chat_completion_chunk(
